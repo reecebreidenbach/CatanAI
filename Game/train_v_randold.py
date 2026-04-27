@@ -49,6 +49,9 @@ REWARD_CONFIG = {
     "win_reward": 5.0,
     "loss_penalty": 5.0,
     "setup_settle_reward": 0.5,
+    "robber_block_reward": 0.1,
+    "monopoly_reward": 0.3,
+    "yop_build_reward": 0.15,
 }
 
 

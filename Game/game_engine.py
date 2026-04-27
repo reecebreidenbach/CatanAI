@@ -33,6 +33,7 @@ Typical inner training loop:
 from __future__ import annotations
 
 import random
+from collections import Counter
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import Optional
@@ -67,9 +68,13 @@ class ActionType(Enum):
     MOVE_ROBBER      = auto()
     DISCARD          = auto()
     END_TURN         = auto()
-    MARITIME_TRADE   = auto()
-    PLAYER_TRADE     = auto()
-    BUY_DEV_CARD     = auto()
+    MARITIME_TRADE      = auto()
+    PLAYER_TRADE        = auto()
+    BUY_DEV_CARD        = auto()
+    PLAY_KNIGHT         = auto()
+    PLAY_MONOPOLY       = auto()
+    PLAY_YEAR_OF_PLENTY = auto()
+    PLAY_ROAD_BUILDING  = auto()
 
 
 @dataclass
@@ -184,7 +189,7 @@ class GameEngine:
         if state.phase == Phase.SETUP:
             return self._legal_setup(state, pid)
         if state.phase == Phase.ROLL:
-            return [Action(ActionType.ROLL_DICE)]
+            return self._legal_roll(state, pid)
         if state.phase == Phase.DISCARD:
             return [Action(ActionType.DISCARD)]   # caller fills .discard
         if state.phase == Phase.ROBBER:
@@ -240,6 +245,17 @@ class GameEngine:
 
     # ── legal-action helpers ───────────────────────────────────────────────────
 
+    def _legal_roll(self, state: GameState, pid: int) -> list[Action]:
+        """
+        Before rolling, the player must roll — but may play a Knight first.
+        """
+        actions: list[Action] = [Action(ActionType.ROLL_DICE)]
+        if not state.dev_card_played_this_turn:
+            dc = Counter(state.players[pid].dev_cards)
+            if dc[DevCard.KNIGHT] > 0:
+                actions.append(Action(ActionType.PLAY_KNIGHT))
+        return actions
+
     def _legal_setup(self, state: GameState, pid: int) -> list[Action]:
         topo = state.topology
         if state.setup_step == 0:
@@ -286,16 +302,29 @@ class GameEngine:
         """
         During the main phase the player may (in any order and any number
         of times, subject to resources and piece supply):
-          - Build a road
+          - Build a road (or place free roads if road_building dev card was played)
           - Build a settlement
           - Upgrade a settlement to a city
+          - Play a dev card (one per turn, not bought this turn)
+          - Make a maritime trade
+          - Buy a development card
           - End their turn (always available)
-        Dev cards and trading are stubs for a future iteration.
         """
         p    = state.players[pid]
         topo = state.topology
         actions: list[Action] = [Action(ActionType.END_TURN)]
 
+        # ── Free-road sub-mode (Road Building dev card) ────────────────────
+        # When free_roads_remaining > 0, the player must place free roads
+        # (or end turn to forfeit remaining free roads).
+        if state.free_roads_remaining > 0:
+            if p.roads_left > 0:
+                for e in range(topo.num_edges):
+                    if self._ok_road_edge(state, e, pid):
+                        actions.append(Action(ActionType.PLACE_ROAD, edge_id=e))
+            return actions
+
+        # ── Normal main phase ──────────────────────────────────────────────
         if p.roads_left > 0 and p.can_afford(self.BUILD_COSTS["road"]):
             for e in range(topo.num_edges):
                 if self._ok_road_edge(state, e, pid):
@@ -323,6 +352,33 @@ class GameEngine:
         # Buy a development card
         if state.dev_deck and p.can_afford(self.BUILD_COSTS["dev_card"]):
             actions.append(Action(ActionType.BUY_DEV_CARD))
+
+        # ── Dev card plays (one per turn, not bought this turn) ────────────
+        if not state.dev_card_played_this_turn:
+            dc = Counter(p.dev_cards)
+
+            if dc[DevCard.KNIGHT] > 0:
+                actions.append(Action(ActionType.PLAY_KNIGHT))
+
+            if dc[DevCard.MONOPOLY] > 0:
+                for r in Resource:
+                    actions.append(Action(ActionType.PLAY_MONOPOLY, receive=r))
+
+            if dc[DevCard.YEAR_OF_PLENTY] > 0:
+                for i, r1 in enumerate(list(Resource)):
+                    for r2 in list(Resource)[i:]:
+                        # Bank must have enough of each requested resource
+                        if r1 == r2:
+                            if state.bank.get(r1, 0) >= 2:
+                                actions.append(Action(ActionType.PLAY_YEAR_OF_PLENTY,
+                                                      give=r1, receive=r2))
+                        else:
+                            if state.bank.get(r1, 0) >= 1 and state.bank.get(r2, 0) >= 1:
+                                actions.append(Action(ActionType.PLAY_YEAR_OF_PLENTY,
+                                                      give=r1, receive=r2))
+
+            if dc[DevCard.ROAD_BUILDING] > 0 and p.roads_left > 0:
+                actions.append(Action(ActionType.PLAY_ROAD_BUILDING))
 
         return actions
 
@@ -400,16 +456,20 @@ class GameEngine:
     def _apply(self, state: GameState, action: Action) -> None:
         """Dispatch to the appropriate handler (state is mutated in place)."""
         dispatch = {
-            ActionType.PLACE_SETTLEMENT: self._do_settlement,
-            ActionType.PLACE_ROAD:       self._do_road,
-            ActionType.UPGRADE_CITY:     self._do_city,
-            ActionType.ROLL_DICE:        self._do_roll,
-            ActionType.MOVE_ROBBER:      self._do_robber,
-            ActionType.DISCARD:          self._do_discard,
-            ActionType.END_TURN:         self._do_end_turn,
-            ActionType.MARITIME_TRADE:   self._do_trade,
-            ActionType.PLAYER_TRADE:     self._do_player_trade,
-            ActionType.BUY_DEV_CARD:     self._do_buy_dev_card,
+            ActionType.PLACE_SETTLEMENT:  self._do_settlement,
+            ActionType.PLACE_ROAD:        self._do_road,
+            ActionType.UPGRADE_CITY:      self._do_city,
+            ActionType.ROLL_DICE:         self._do_roll,
+            ActionType.MOVE_ROBBER:       self._do_robber,
+            ActionType.DISCARD:           self._do_discard,
+            ActionType.END_TURN:          self._do_end_turn,
+            ActionType.MARITIME_TRADE:    self._do_trade,
+            ActionType.PLAYER_TRADE:      self._do_player_trade,
+            ActionType.BUY_DEV_CARD:      self._do_buy_dev_card,
+            ActionType.PLAY_KNIGHT:         self._do_play_knight,
+            ActionType.PLAY_MONOPOLY:       self._do_play_monopoly,
+            ActionType.PLAY_YEAR_OF_PLENTY: self._do_play_year_of_plenty,
+            ActionType.PLAY_ROAD_BUILDING:  self._do_play_road_building,
         }
         dispatch[action.type](state, action)
 
@@ -443,10 +503,14 @@ class GameEngine:
         pid = state.current_player
 
         if state.phase == Phase.MAIN:
-            cost = self.BUILD_COSTS["road"]
-            state.players[pid].spend(cost)
-            for r, amt in cost.items():
-                state.bank[r] = state.bank.get(r, 0) + amt
+            if state.free_roads_remaining > 0:
+                # Free road from Road Building dev card — no resource cost
+                state.free_roads_remaining -= 1
+            else:
+                cost = self.BUILD_COSTS["road"]
+                state.players[pid].spend(cost)
+                for r, amt in cost.items():
+                    state.bank[r] = state.bank.get(r, 0) + amt
 
         state.edge_owner[e] = pid
         state.players[pid].roads_left -= 1
@@ -503,7 +567,13 @@ class GameEngine:
                 stolen = random.choice(pool)
                 victim.resources[stolen] -= 1
                 thief.resources[stolen]  += 1
-        state.phase = Phase.MAIN
+
+        if state.robber_from_knight:
+            # Knight was played before rolling: return to roll phase
+            state.robber_from_knight = False
+            state.phase = Phase.ROLL if state.last_roll is None else Phase.MAIN
+        else:
+            state.phase = Phase.MAIN
 
     def _do_discard(self, state: GameState, action: Action) -> None:
         """
@@ -532,6 +602,10 @@ class GameEngine:
         # Cards bought this turn become playable next turn
         p.dev_cards.extend(p.dev_cards_new)
         p.dev_cards_new.clear()
+
+        # Reset per-turn dev card flags
+        state.dev_card_played_this_turn = False
+        state.free_roads_remaining      = 0
 
         state.turn_number    += 1
         state.current_player  = (state.current_player + 1) % len(state.players)
@@ -581,6 +655,67 @@ class GameEngine:
             state.players[pid].resources[r]         = (
                 state.players[pid].resources.get(r, 0) + amt
             )
+
+    # ── dev card handlers ────────────────────────────────────────────────────────
+
+    def _do_play_knight(self, state: GameState, action: Action) -> None:
+        """
+        Play a Knight: move the robber (triggers ROBBER phase).
+        If played before rolling, we return to ROLL after the robber resolves.
+        Awards Largest Army if applicable.
+        """
+        pid = state.current_player
+        state.players[pid].dev_cards.remove(DevCard.KNIGHT)
+        state.players[pid].knights_played += 1
+        state.dev_card_played_this_turn = True
+        self._update_largest_army(state)
+        state.robber_from_knight = True
+        state.phase = Phase.ROBBER
+
+    def _do_play_monopoly(self, state: GameState, action: Action) -> None:
+        """
+        Play a Monopoly: steal all of a chosen resource from every opponent.
+        Resources go directly between players (no bank involved).
+        """
+        pid      = state.current_player
+        resource = action.receive
+        state.players[pid].dev_cards.remove(DevCard.MONOPOLY)
+        state.dev_card_played_this_turn = True
+        for i, p in enumerate(state.players):
+            if i != pid:
+                amount = p.resources.get(resource, 0)
+                p.resources[resource] = 0
+                state.players[pid].resources[resource] = (
+                    state.players[pid].resources.get(resource, 0) + amount
+                )
+
+    def _do_play_year_of_plenty(self, state: GameState, action: Action) -> None:
+        """
+        Play Year of Plenty: take up to 2 resources from the bank.
+        action.give  = first resource,  action.receive = second resource.
+        Both may be the same (take 2 of one type) subject to bank supply.
+        """
+        pid = state.current_player
+        state.players[pid].dev_cards.remove(DevCard.YEAR_OF_PLENTY)
+        state.dev_card_played_this_turn = True
+        r1, r2 = action.give, action.receive
+        for r in (r1, r2):
+            if state.bank.get(r, 0) > 0:
+                state.players[pid].resources[r] = (
+                    state.players[pid].resources.get(r, 0) + 1
+                )
+                state.bank[r] -= 1
+
+    def _do_play_road_building(self, state: GameState, action: Action) -> None:
+        """
+        Play Road Building: place up to 2 free roads.
+        Sets free_roads_remaining so that subsequent PLACE_ROAD actions
+        in _legal_main are offered without resource cost.
+        """
+        pid = state.current_player
+        state.players[pid].dev_cards.remove(DevCard.ROAD_BUILDING)
+        state.dev_card_played_this_turn = True
+        state.free_roads_remaining = min(2, state.players[pid].roads_left)
 
     # ── trade helpers ────────────────────────────────────────────────────────────
 

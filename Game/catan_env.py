@@ -95,16 +95,20 @@ NUM_PHASES    = len(_PHASES)       # 6
 
 
 # ── Action index layout ─────────────────────────────────────────────────────────
-ACTION_SIZE   = 298   # total number of distinct RL actions
+ACTION_SIZE   = 320   # total number of distinct RL actions
 
-_ACT_ROLL     = 0
-_ACT_SETTLE   = 1          # + vertex_id  →  1..54
-_ACT_ROAD     = 55         # + edge_id    → 55..126
-_ACT_CITY     = 127        # + vertex_id  → 127..180
-_ACT_ROBBER   = 181        # + hex_id*5 + steal_slot → 181..275
-_ACT_END      = 276
-_ACT_TRADE    = 277        # + trade_sub_idx → 277..296   (20 combos)
-_ACT_BUY      = 297
+_ACT_ROLL         = 0
+_ACT_SETTLE       = 1          # + vertex_id  →  1..54
+_ACT_ROAD         = 55         # + edge_id    → 55..126
+_ACT_CITY         = 127        # + vertex_id  → 127..180
+_ACT_ROBBER       = 181        # + hex_id*5 + steal_slot → 181..275
+_ACT_END          = 276
+_ACT_TRADE        = 277        # + trade_sub_idx → 277..296   (20 combos)
+_ACT_BUY          = 297
+_ACT_KNIGHT       = 298        # 1 action
+_ACT_MONOPOLY     = 299        # + resource_idx → 299..303  (5 actions)
+_ACT_YOP          = 304        # + combo_idx   → 304..318  (15 combos)
+_ACT_ROAD_BUILDING = 319       # 1 action
 
 
 def _trade_sub(give: Resource, recv: Resource) -> int:
@@ -120,6 +124,28 @@ def _trade_sub_inv(sub: int) -> tuple[Resource, Resource]:
     g, rr = divmod(sub, 4)
     r     = rr if rr < g else rr + 1
     return _RESOURCES[g], _RESOURCES[r]
+
+
+# Year of Plenty: 15 (r1, r2) combos where r1_idx <= r2_idx (with repetition allowed)
+_YOP_COMBOS: list[tuple[Resource, Resource]] = [
+    (r1, r2)
+    for i, r1 in enumerate(_RESOURCES)
+    for r2 in _RESOURCES[i:]
+]
+_YOP_COMBO_INDEX: dict[tuple[Resource, Resource], int] = {
+    combo: idx for idx, combo in enumerate(_YOP_COMBOS)
+}
+
+
+def _yop_sub(r1: Resource, r2: Resource) -> int:
+    """Encode a Year of Plenty (r1, r2) pair as 0..14.  r1_idx must be <= r2_idx."""
+    key = (r1, r2) if _RESOURCES.index(r1) <= _RESOURCES.index(r2) else (r2, r1)
+    return _YOP_COMBO_INDEX[key]
+
+
+def _yop_sub_inv(sub: int) -> tuple[Resource, Resource]:
+    """Inverse of _yop_sub."""
+    return _YOP_COMBOS[sub]
 
 
 # ── Observation size ────────────────────────────────────────────────────────────
@@ -274,6 +300,14 @@ def encode_action(action: Action, state: GameState) -> int:
         return _ACT_TRADE + _trade_sub(action.give, action.receive)
     if t == ActionType.BUY_DEV_CARD:
         return _ACT_BUY
+    if t == ActionType.PLAY_KNIGHT:
+        return _ACT_KNIGHT
+    if t == ActionType.PLAY_MONOPOLY:
+        return _ACT_MONOPOLY + _RESOURCES.index(action.receive)
+    if t == ActionType.PLAY_YEAR_OF_PLENTY:
+        return _ACT_YOP + _yop_sub(action.give, action.receive)
+    if t == ActionType.PLAY_ROAD_BUILDING:
+        return _ACT_ROAD_BUILDING
     raise ValueError(
         f"Cannot encode {t.name} into flat RL action space "
         "(PLAYER_TRADE and DISCARD are handled outside the action index)"
@@ -303,6 +337,15 @@ def decode_action(idx: int, state: GameState) -> Action:
         return Action(ActionType.MARITIME_TRADE, give=give, receive=recv)
     if idx == _ACT_BUY:
         return Action(ActionType.BUY_DEV_CARD)
+    if idx == _ACT_KNIGHT:
+        return Action(ActionType.PLAY_KNIGHT)
+    if _ACT_MONOPOLY <= idx < _ACT_YOP:
+        return Action(ActionType.PLAY_MONOPOLY, receive=_RESOURCES[idx - _ACT_MONOPOLY])
+    if _ACT_YOP <= idx < _ACT_ROAD_BUILDING:
+        r1, r2 = _yop_sub_inv(idx - _ACT_YOP)
+        return Action(ActionType.PLAY_YEAR_OF_PLENTY, give=r1, receive=r2)
+    if idx == _ACT_ROAD_BUILDING:
+        return Action(ActionType.PLAY_ROAD_BUILDING)
     raise ValueError(f"Unknown action index {idx} (valid range 0..{ACTION_SIZE-1})")
 
 
@@ -444,6 +487,9 @@ class CatanEnv:
         win_reward: float = 5.0,
         loss_penalty: float = 5.0,
         setup_settle_reward: float = 0.5,
+        robber_block_reward: float = 0.1,
+        monopoly_reward: float = 0.3,
+        yop_build_reward: float = 0.15,
     ) -> None:
         if not (2 <= num_players <= 4):
             raise ValueError("num_players must be 2–4")
@@ -456,6 +502,9 @@ class CatanEnv:
         self.win_reward           = win_reward
         self.loss_penalty         = loss_penalty
         self.setup_settle_reward  = setup_settle_reward
+        self.robber_block_reward  = robber_block_reward
+        self.monopoly_reward      = monopoly_reward
+        self.yop_build_reward     = yop_build_reward
         self._engine              = GameEngine()
         self._state: Optional[GameState] = None
         self._prev_vp: list[int] = []
@@ -584,6 +633,58 @@ class CatanEnv:
 
                 if action.type == ActionType.BUY_DEV_CARD and new_dev_total > old_dev_total:
                     rewards[acting_pid] += self.buy_dev_reward
+
+                # ── Dev card play rewards ──────────────────────────────────
+                if action.type == ActionType.MOVE_ROBBER:
+                    # Reward placing the robber on a productive hex that hurts an opponent.
+                    # Applies whether triggered by a 7 or a Knight card.
+                    target_hex = action.hex_id
+                    has_opponent = any(
+                        state.vertex_owner[v] not in (-1, acting_pid)
+                        for v in state.topology.hex_vertices[target_hex]
+                    )
+                    pip = sum(
+                        _PIP_TABLE.get(state.board.hexes[target_hex].token or 0, 0)
+                        for _ in [1]   # single-element loop for expression
+                    )
+                    if has_opponent and pip >= 3:
+                        rewards[acting_pid] += self.robber_block_reward * (pip / 5.0)
+
+                if action.type == ActionType.PLAY_MONOPOLY:
+                    # Reward proportional to how many cards were stolen.
+                    resource = action.receive
+                    cards_before = sum(
+                        state.players[i].resources.get(resource, 0)
+                        for i in range(self.num_players) if i != acting_pid
+                    )
+                    cards_after = sum(
+                        self._state.players[i].resources.get(resource, 0)
+                        for i in range(self.num_players) if i != acting_pid
+                    )
+                    stolen = cards_before - cards_after
+                    if stolen > 0:
+                        rewards[acting_pid] += self.monopoly_reward * min(stolen / 8.0, 1.0)
+
+                if action.type == ActionType.PLAY_YEAR_OF_PLENTY:
+                    # Reward if the gained resources come from outside normal production
+                    # AND now enable the player to afford something they couldn't before.
+                    r1, r2 = action.give, action.receive
+                    produces: set[Resource] = set()
+                    for v in range(state.topology.num_vertices):
+                        if state.vertex_owner[v] == acting_pid:
+                            for hidx in state.topology.vertex_hexes[v]:
+                                res = HEX_RESOURCE[state.board.hexes[hidx].hex_type]
+                                if res is not None:
+                                    produces.add(res)
+                    gained_outside = r1 not in produces or r2 not in produces
+                    p_new = self._state.players[acting_pid]
+                    can_build = (
+                        p_new.can_afford(self._engine.BUILD_COSTS["road"]) or
+                        p_new.can_afford(self._engine.BUILD_COSTS["settlement"]) or
+                        p_new.can_afford(self._engine.BUILD_COSTS["city"])
+                    )
+                    if can_build and gained_outside:
+                        rewards[acting_pid] += self.yop_build_reward
 
         if done and self._state.winner is not None:
             winner = self._state.winner

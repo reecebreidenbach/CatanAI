@@ -221,6 +221,11 @@ class GameState:
     pending_discards: list[int] = field(default_factory=list)
     rolling_player:   Optional[int] = None   # player who rolled the 7
 
+    # Dev card sub-state
+    dev_card_played_this_turn: bool = False   # only one dev card per turn
+    free_roads_remaining:      int  = 0       # roads left from Road Building card
+    robber_from_knight:        bool = False   # True if robber triggered by Knight (not a 7)
+
     # Special development cards (None until first holder qualifies)
     longest_road_owner:  Optional[int] = None
     largest_army_owner:  Optional[int] = None

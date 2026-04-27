@@ -22,7 +22,7 @@ import torch
 import torch.nn.functional as F
 from collections import defaultdict
 
-from catan_env     import CatanEnv, RandomAgent, _ACT_ROLL, _ACT_END, _ACT_SETTLE, _ACT_ROAD, _ACT_CITY, _ACT_ROBBER, _ACT_TRADE, _ACT_BUY
+from catan_env     import CatanEnv, RandomAgent, _ACT_ROLL, _ACT_END, _ACT_SETTLE, _ACT_ROAD, _ACT_CITY, _ACT_ROBBER, _ACT_TRADE, _ACT_BUY, _ACT_KNIGHT, _ACT_MONOPOLY, _ACT_YOP, _ACT_ROAD_BUILDING
 from ppo_utils     import (
     NUM_PLAYERS, HIDDEN_SIZE, N_STEPS, LOG_EVERY,
     GAMMA, GAE_LAMBDA,
@@ -31,7 +31,7 @@ from ppo_utils     import (
 )
 
 # ── Phase 1 specific settings ────────────────────────────────────────────────
-NUM_UPDATES          = 500   # how many PPO updates to run in this phase
+NUM_UPDATES          = 300   # how many PPO updates to run in this phase
 N_EPISODES_PER_UPDATE = 4    # complete games collected before each update
 EPISODE_TIMEOUT      = 8000  # steps per game safety limit (no winner declared)
 REWARD_CONFIG = {
@@ -41,6 +41,9 @@ REWARD_CONFIG = {
     "win_reward": 5.0,
     "loss_penalty": 5.0,
     "setup_settle_reward": 0.5,
+    "robber_block_reward": 0.1,
+    "monopoly_reward": 0.3,
+    "yop_build_reward": 0.15,
 }
 
 
@@ -85,14 +88,18 @@ print(f"Phase 1: one random seat learns vs {NUM_PLAYERS - 1} RandomAgents for {N
 # ── Rollout collection ────────────────────────────────────────────────────────
 
 def _act_type(idx: int) -> str:
-    if idx == _ACT_ROLL:                       return "roll"
-    if idx == _ACT_END:                        return "end"
-    if _ACT_SETTLE <= idx < _ACT_ROAD:         return "settle"
-    if _ACT_ROAD   <= idx < _ACT_CITY:         return "road"
-    if _ACT_CITY   <= idx < _ACT_ROBBER:       return "city"
-    if _ACT_ROBBER <= idx < _ACT_END:          return "robber"
-    if _ACT_TRADE  <= idx < _ACT_BUY:          return "trade"
-    if idx == _ACT_BUY:                        return "buydev"
+    if idx == _ACT_ROLL:                            return "roll"
+    if idx == _ACT_END:                             return "end"
+    if _ACT_SETTLE <= idx < _ACT_ROAD:              return "settle"
+    if _ACT_ROAD   <= idx < _ACT_CITY:              return "road"
+    if _ACT_CITY   <= idx < _ACT_ROBBER:            return "city"
+    if _ACT_ROBBER <= idx < _ACT_END:               return "robber"
+    if _ACT_TRADE  <= idx < _ACT_BUY:               return "trade"
+    if idx == _ACT_BUY:                             return "buydev"
+    if idx == _ACT_KNIGHT:                          return "knight"
+    if _ACT_MONOPOLY <= idx < _ACT_YOP:             return "monopoly"
+    if _ACT_YOP <= idx < _ACT_ROAD_BUILDING:        return "yop"
+    if idx == _ACT_ROAD_BUILDING:                   return "roadbuild"
     return "other"
 
 
