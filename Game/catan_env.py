@@ -643,12 +643,16 @@ class CatanEnv:
                         state.vertex_owner[v] not in (-1, acting_pid)
                         for v in state.topology.hex_vertices[target_hex]
                     )
-                    pip = sum(
-                        _PIP_TABLE.get(state.board.hexes[target_hex].token or 0, 0)
-                        for _ in [1]   # single-element loop for expression
-                    )
-                    if has_opponent and pip >= 3:
+                    pip = _PIP_TABLE.get(state.board.hexes[target_hex].token or 0, 0)
+                    if pip == 0:
+                        # Desert or token-less hex — actively penalise this choice.
+                        rewards[acting_pid] -= self.robber_block_reward
+                    else:
+                        # Always reward landing on a productive hex (pip gradient).
                         rewards[acting_pid] += self.robber_block_reward * (pip / 5.0)
+                        # Bonus when an opponent settlement/city is also on that hex.
+                        if has_opponent:
+                            rewards[acting_pid] += self.robber_block_reward * (pip / 5.0)
 
                 if action.type == ActionType.PLAY_MONOPOLY:
                     # Reward proportional to how many cards were stolen.

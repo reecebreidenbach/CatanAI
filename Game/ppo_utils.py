@@ -10,6 +10,7 @@ Imported by:
 
 import torch
 import torch.nn.functional as F
+import numpy as np
 from policy import CatanPolicy
 
 # Edit these here and every phase file picks up the change automatically.
@@ -105,17 +106,21 @@ def compute_gae(
     advantages : float32 tensor, shape (n,)
     returns    : float32 tensor, shape (n,)  — value prediction targets
     """
-    advantages = []
-    gae        = 0.0
-    next_val   = 0.0
+    n          = len(rewards)
+    advantages = np.empty(n, dtype=np.float32)
+    val_arr    = np.array([v.item() for v in values], dtype=np.float32)
+    rew_arr    = np.array(rewards, dtype=np.float32)
+    don_arr    = np.array(dones,   dtype=np.float32)
 
-    for r, v, d in zip(reversed(rewards), reversed(values), reversed(dones)):
-        delta    = r + gamma * next_val * (1.0 - d) - v.item()
-        gae      = delta + gamma * lam * (1.0 - d) * gae
-        advantages.insert(0, gae)
-        next_val = v.item()
+    gae      = 0.0
+    next_val = 0.0
+    for i in range(n - 1, -1, -1):
+        delta       = rew_arr[i] + gamma * next_val * (1.0 - don_arr[i]) - val_arr[i]
+        gae         = delta + gamma * lam * (1.0 - don_arr[i]) * gae
+        advantages[i] = gae
+        next_val    = val_arr[i]
 
-    adv_t = torch.tensor(advantages, dtype=torch.float32)
+    adv_t = torch.from_numpy(advantages)
     ret_t = adv_t + torch.stack(values)
     return adv_t, ret_t
 
@@ -143,8 +148,11 @@ def ppo_update(buf: dict, advantages: torch.Tensor, returns: torch.Tensor,
     -------
     total_loss : summed scalar loss over all mini-batch steps (for logging)
     """
-    obs     = torch.stack(buf["obs"])
-    masks   = torch.stack(buf["masks"])
+    # obs and masks may be a mix of per-episode 2-D tensors (from the fast
+    # numpy-batch path) and individual 1-D tensors (from older callers).
+    # cat handles both cases uniformly.
+    obs     = torch.cat([t if t.dim() == 2 else t.unsqueeze(0) for t in buf["obs"]])
+    masks   = torch.cat([t if t.dim() == 2 else t.unsqueeze(0) for t in buf["masks"]])
     actions = torch.stack(buf["actions"])
     old_lp  = torch.stack(buf["log_probs"]).detach()
     n       = len(obs)

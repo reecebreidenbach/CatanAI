@@ -33,13 +33,13 @@ from ppo_utils     import (
 # ── Phase 1 specific settings ────────────────────────────────────────────────
 NUM_UPDATES          = 300   # how many PPO updates to run in this phase
 N_EPISODES_PER_UPDATE = 4    # complete games collected before each update
-EPISODE_TIMEOUT      = 8000  # steps per game safety limit (no winner declared)
+EPISODE_TIMEOUT      = 3000  # steps per game safety limit (no winner declared)
 REWARD_CONFIG = {
-    "public_vp_reward": 0.3,
-    "road_reward": 0.05,
+    "public_vp_reward": 0.5,
+    "road_reward": 0.08,
     "buy_dev_reward": 0.10,
     "win_reward": 5.0,
-    "loss_penalty": 5.0,
+    "loss_penalty": 7.0,  # strong but not 2x win_reward — avoids gradient spikes
     "setup_settle_reward": 0.5,
     "robber_block_reward": 0.1,
     "monopoly_reward": 0.3,
@@ -77,8 +77,12 @@ resume_path = _latest_checkpoint_path()
 save_path = _next_checkpoint_path()
 
 if resume_path is not None:
-    policy.load_state_dict(torch.load(resume_path))
-    print(f"Resumed from {resume_path.name}")
+    try:
+        policy.load_state_dict(torch.load(resume_path))
+        print(f"Resumed from {resume_path.name}")
+    except RuntimeError as e:
+        print(f"WARNING: Could not load checkpoint {resume_path.name}: {e}")
+        print("Starting Phase 1 from scratch (checkpoint architecture mismatch).")
 else:
     print("Starting Phase 1 from scratch.")
 
@@ -115,6 +119,8 @@ def collect_rollout(n_episodes: int) -> tuple:
 
     Returns (buf, episode_wins, learner_wins, action_counts).
     """
+    import numpy as np
+    obs_size = env.obs_size()
     buf = {"obs": [], "masks": [], "actions": [], "log_probs": [], "values": [], "rewards": [], "dones": []}
     episode_wins: dict = defaultdict(int)
     learner_wins = 0
@@ -124,32 +130,38 @@ def collect_rollout(n_episodes: int) -> tuple:
         learner_pid      = random.randrange(NUM_PLAYERS)
         obs, mask       = env.reset()
         ep_steps        = 0
-        ep_learner_buf  = {"obs": [], "masks": [], "actions": [], "log_probs": [], "values": [], "rewards": [], "dones": []}
+        ep_obs:      list = []
+        ep_masks:    list = []
+        ep_actions:  list = []
+        ep_log_probs:list = []
+        ep_values:   list = []
+        ep_rewards:  list = []
+        ep_dones:    list = []
 
         while True:
             ep_steps += 1
             if ep_steps > EPISODE_TIMEOUT:
-                # Abandon without declaring a winner — no terminal reward
                 break
 
             pid = env.current_player
 
             if pid != learner_pid:
-                # Random opponent — just step the environment, don't record
                 action_idx = random_agents[0].choose(obs, mask)
                 _, done    = env.step(action_idx)
                 if done:
                     if env.winner is not None:
                         episode_wins[env.winner] += 1
                         learner_wins += int(env.winner == learner_pid)
+                        if env.winner != learner_pid and ep_rewards:
+                            ep_rewards[-1] -= REWARD_CONFIG["loss_penalty"]
                     break
                 else:
                     obs, mask = env.observe()
                 continue
 
             # Learner seat — live policy, record for training
-            obs_t  = torch.tensor(obs,  dtype=torch.float32)
-            mask_t = torch.tensor(mask, dtype=torch.bool)
+            obs_t  = torch.from_numpy(obs).float()
+            mask_t = torch.from_numpy(mask)
 
             with torch.no_grad():
                 logits, value = policy(obs_t)
@@ -162,26 +174,35 @@ def collect_rollout(n_episodes: int) -> tuple:
             reward = rewards[learner_pid]
             action_counts[_act_type(action.item())] += 1
 
-            ep_learner_buf["obs"].append(obs_t)
-            ep_learner_buf["masks"].append(mask_t.clone())
-            ep_learner_buf["actions"].append(action)
-            ep_learner_buf["log_probs"].append(dist.log_prob(action))
-            ep_learner_buf["values"].append(value.squeeze(-1))
-            ep_learner_buf["rewards"].append(reward)
-            ep_learner_buf["dones"].append(float(done))
+            ep_obs.append(obs)
+            ep_masks.append(mask)
+            ep_actions.append(action)
+            ep_log_probs.append(dist.log_prob(action))
+            ep_values.append(value.squeeze(-1))
+            ep_rewards.append(reward)
+            ep_dones.append(float(done))
 
             if done:
                 if env.winner is not None:
                     episode_wins[env.winner] += 1
                     learner_wins += int(env.winner == learner_pid)
+                    if env.winner != learner_pid and ep_rewards:
+                        ep_rewards[-1] -= REWARD_CONFIG["loss_penalty"]
                 break
             else:
                 obs, mask = env.observe()
 
-        # Only add this episode's data if the learner took at least one action
-        if ep_learner_buf["obs"]:
-            for k in buf:
-                buf[k].extend(ep_learner_buf[k])
+        if ep_obs:
+            # Convert numpy arrays in bulk rather than stacking per-step tensors
+            buf["obs"].append(torch.from_numpy(np.array(ep_obs, dtype=np.float32)))
+            buf["masks"].append(torch.from_numpy(np.array(ep_masks, dtype=bool)))
+            buf["actions"].extend(ep_actions)
+            buf["log_probs"].extend(ep_log_probs)
+            buf["values"].extend(ep_values)
+            buf["rewards"].extend(ep_rewards)
+            buf["dones"].extend(ep_dones)
+
+    return buf, episode_wins, learner_wins, action_counts
 
     return buf, episode_wins, learner_wins, action_counts
 
