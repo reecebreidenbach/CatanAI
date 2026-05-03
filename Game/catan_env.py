@@ -166,6 +166,7 @@ def _obs_size(num_players: int) -> int:
         + (N + 1) * 2                      # longest_road_owner, largest_army_owner (one-hot)
         + NUM_RESOURCES                    # bank (normalised /19)
         + 1                                # dev deck remaining (normalised /25)
+        + NUM_VERTICES * 2                 # per-vertex pip score + diversity (settlement guidance)
         + NUM_PHASES                       # phase one-hot
     )
 
@@ -255,6 +256,13 @@ def encode_obs(state: GameState, agent_pid: int, engine: GameEngine) -> np.ndarr
     for r in _RESOURCES:
         obs.append(state.bank.get(r, 0) / 19.0)
     obs.append(len(state.dev_deck) / 25.0)
+
+    # ── Per-vertex pip score + diversity (settlement placement guidance) ──────
+    # Gives the network an explicit signal about each vertex's resource value
+    # without requiring it to memorize the board topology through weights.
+    for v in range(topo.num_vertices):
+        obs.append(_vertex_pip_score(v, state) / 15.0)
+        obs.append(_vertex_resource_diversity(v, state) / 3.0)
 
     # ── Phase one-hot ─────────────────────────────────────────────────────────
     obs.extend(1.0 if state.phase == p else 0.0 for p in _PHASES)
@@ -394,6 +402,59 @@ def _vertex_resource_diversity(vertex_id: int, state: "GameState") -> int:
     return len(resources)
 
 
+def _vertex_resources(vertex_id: int, state: "GameState") -> set:
+    """Set of distinct resources produceable from hexes adjacent to vertex_id."""
+    resources: set = set()
+    for hidx in state.topology.vertex_hexes[vertex_id]:
+        res = HEX_RESOURCE.get(state.board.hexes[hidx].hex_type)
+        if res is not None:
+            resources.add(res)
+    return resources
+
+
+def _player_setup_resource_union(pid: int, state: "GameState") -> set:
+    """Distinct resources available from the player's already-placed setup settlements."""
+    resources: set = set()
+    for vertex_id, owner in enumerate(state.vertex_owner):
+        if owner == pid and state.vertex_building[vertex_id] == 1:
+            resources.update(_vertex_resources(vertex_id, state))
+    return resources
+
+
+def _player_production_resources(pid: int, state: "GameState") -> set:
+    """Distinct resources produced by the player's current settlements/cities."""
+    resources: set = set()
+    for vertex_id, owner in enumerate(state.vertex_owner):
+        if owner == pid and state.vertex_building[vertex_id] in (1, 2):
+            resources.update(_vertex_resources(vertex_id, state))
+    return resources
+
+
+def _player_expected_production(pid: int, state: "GameState") -> float:
+    """Expected pip-weighted production from the player's current board."""
+    total = 0.0
+    for vertex_id, owner in enumerate(state.vertex_owner):
+        if owner != pid:
+            continue
+        building = state.vertex_building[vertex_id]
+        if building == 1:
+            total += _vertex_pip_score(vertex_id, state)
+        elif building == 2:
+            total += 2.0 * _vertex_pip_score(vertex_id, state)
+    return total
+
+
+def _settlement_target_score(vertex_id: int, pid: int, state: "GameState") -> float:
+    """Heuristic value of settling this vertex for road-planning decisions."""
+    vertex_resources = _vertex_resources(vertex_id, state)
+    pip_score = _vertex_pip_score(vertex_id, state) / 15.0
+    diversity_score = len(vertex_resources) / 3.0
+    # Favor roads that expand into resources the player doesn't already produce.
+    owned_resources = _player_production_resources(pid, state)
+    complement_score = len(vertex_resources - owned_resources) / 3.0
+    return pip_score + diversity_score + complement_score
+
+
 def _reachable_buildable_count(state: "GameState", pid: int) -> int:
     """
     Count empty, buildable vertices reachable by pid along their road network.
@@ -424,6 +485,116 @@ def _reachable_buildable_count(state: "GameState", pid: int) -> int:
         )
 
     return sum(1 for v in reachable if v not in owned and buildable(v))
+
+
+def _reachable_buildable_verts(state: "GameState", pid: int) -> set[int]:
+    """Return empty, currently buildable vertices reachable by pid's road network."""
+    topo = state.topology
+    owned = {v for v in range(topo.num_vertices) if state.vertex_owner[v] == pid}
+
+    reachable: set[int] = set(owned)
+    frontier: list[int] = list(owned)
+    while frontier:
+        v = frontier.pop()
+        for eid in topo.vertex_edges[v]:
+            if state.edge_owner[eid] == pid:
+                v1, v2 = topo.edge_vertices[eid]
+                nv = v2 if v1 == v else v1
+                if nv not in reachable:
+                    reachable.add(nv)
+                    frontier.append(nv)
+
+    return {
+        v for v in reachable if v not in owned
+        and state.vertex_owner[v] == -1
+        and all(state.vertex_owner[nv] == -1 for nv in topo.vertex_neighbors[v])
+    }
+
+
+def _best_reachable_settlement_score(state: "GameState", pid: int) -> float:
+    """Best current settlement target reachable by pid, or 0.0 if none."""
+    buildable = _reachable_buildable_verts(state, pid)
+    return max((_settlement_target_score(v, pid, state) for v in buildable), default=0.0)
+
+
+def _best_road_expansion_value(state: "GameState", pid: int, engine: GameEngine) -> float:
+    """Best frontier improvement available from a currently legal road build."""
+    old_best = _best_reachable_settlement_score(state, pid)
+    best_value = 0.0
+    for road_action in engine.legal_actions(state):
+        if road_action.type != ActionType.PLACE_ROAD:
+            continue
+        next_state, _reward, _done = engine.step(state, road_action)
+        new_best = _best_reachable_settlement_score(next_state, pid)
+        improvement = max(0.0, new_best - old_best)
+        if improvement > 0.0:
+            best_value = max(best_value, new_best + improvement)
+    return best_value
+
+
+def _setup_road_direction_score(edge_id: int, pid: int, state: "GameState") -> float:
+    """Look one road ahead from the chosen setup road and score the best future site."""
+    topo = state.topology
+    start_vertex = state.last_placed_settlement
+    if start_vertex is None:
+        return 0.0
+
+    v1, v2 = topo.edge_vertices[edge_id]
+    frontier_vertex = v2 if v1 == start_vertex else v1
+    owned_resources = _player_setup_resource_union(pid, state)
+    best_score = 0.0
+
+    for candidate in topo.vertex_neighbors[frontier_vertex]:
+        if candidate == start_vertex:
+            continue
+        if state.vertex_owner[candidate] != -1:
+            continue
+        if any(state.vertex_owner[nv] != -1 for nv in topo.vertex_neighbors[candidate]):
+            continue
+
+        vertex_resources = _vertex_resources(candidate, state)
+        pip_score = _vertex_pip_score(candidate, state) / 15.0
+        diversity_score = len(vertex_resources) / 3.0
+        complement_score = len(vertex_resources - owned_resources) / 3.0
+        best_score = max(best_score, pip_score + diversity_score + complement_score)
+
+    return best_score
+
+
+def _player_resource_pip_totals(pid: int, state: "GameState") -> dict[Resource, float]:
+    """Pip-weighted production totals per resource for the player's current board."""
+    totals = {resource: 0.0 for resource in Resource}
+    for vertex_id, owner in enumerate(state.vertex_owner):
+        if owner != pid:
+            continue
+        building = state.vertex_building[vertex_id]
+        if building not in (1, 2):
+            continue
+        multiplier = 1.0 if building == 1 else 2.0
+        for hidx in state.topology.vertex_hexes[vertex_id]:
+            resource = HEX_RESOURCE.get(state.board.hexes[hidx].hex_type)
+            if resource is None:
+                continue
+            totals[resource] += multiplier * _PIP_TABLE.get(state.board.hexes[hidx].token, 0)
+    return totals
+
+
+def _opening_strategy_bias(pid: int, state: "GameState") -> float:
+    """Positive favors road expansion, negative favors early dev/city play."""
+    totals = _player_resource_pip_totals(pid, state)
+    road_core = totals[Resource.LUMBER] + totals[Resource.BRICK]
+    dev_core = totals[Resource.GRAIN] + totals[Resource.ORE]
+    wool = totals[Resource.WOOL]
+    return (road_core + 0.35 * wool) - (dev_core + 0.35 * wool)
+
+
+def _owned_building_count(state: "GameState", pid: int) -> int:
+    """Count settlements and cities currently on the board for pid."""
+    return sum(
+        1
+        for vertex_id, owner in enumerate(state.vertex_owner)
+        if owner == pid and state.vertex_building[vertex_id] in (1, 2)
+    )
 
 
 # ── Greedy discard helper ───────────────────────────────────────────────────────
@@ -486,10 +657,21 @@ class CatanEnv:
         buy_dev_reward: float = 0.10,
         win_reward: float = 5.0,
         loss_penalty: float = 5.0,
-        setup_settle_reward: float = 0.5,
+        setup_settle_reward: float = 1.0,
         robber_block_reward: float = 0.1,
         monopoly_reward: float = 0.3,
         yop_build_reward: float = 0.15,
+        city_pip_reward: float = 0.15,
+        settlement_prod_reward: float = 0.10,
+        city_prod_reward: float = 0.15,
+        road_waste_penalty: float = 0.05,
+        near_settlement_road_penalty: float = 0.0,
+        setup_road_reward: float = 0.0,
+        expansion_stall_penalty: float = 0.0,
+        opening_strategy_bonus: float = 0.0,
+        maritime_trade_penalty: float = 0.0,
+        empty_trade_penalty: float = 0.0,
+        robber_leader_bonus: float = 0.1,
     ) -> None:
         if not (2 <= num_players <= 4):
             raise ValueError("num_players must be 2–4")
@@ -505,6 +687,17 @@ class CatanEnv:
         self.robber_block_reward  = robber_block_reward
         self.monopoly_reward      = monopoly_reward
         self.yop_build_reward     = yop_build_reward
+        self.city_pip_reward      = city_pip_reward
+        self.settlement_prod_reward = settlement_prod_reward
+        self.city_prod_reward     = city_prod_reward
+        self.road_waste_penalty   = road_waste_penalty
+        self.near_settlement_road_penalty = near_settlement_road_penalty
+        self.setup_road_reward    = setup_road_reward
+        self.expansion_stall_penalty = expansion_stall_penalty
+        self.opening_strategy_bonus = opening_strategy_bonus
+        self.maritime_trade_penalty = maritime_trade_penalty
+        self.empty_trade_penalty = empty_trade_penalty
+        self.robber_leader_bonus  = robber_leader_bonus
         self._engine              = GameEngine()
         self._state: Optional[GameState] = None
         self._prev_vp: list[int] = []
@@ -590,6 +783,7 @@ class CatanEnv:
             len(state.players[acting_pid].dev_cards)
             + len(state.players[acting_pid].dev_cards_new)
         )
+        old_production = _player_expected_production(acting_pid, state)
         new_state, _reward, done = self._engine.step(state, action)
         self._state = new_state
 
@@ -607,43 +801,162 @@ class CatanEnv:
             len(self._state.players[acting_pid].dev_cards)
             + len(self._state.players[acting_pid].dev_cards_new)
         )
+        new_production = _player_expected_production(acting_pid, self._state)
 
         if self.reward_shaping:
             # Setup settlement placement: reward proportional to pip productivity
-            # and resource diversity of the chosen vertex.  Setup roads are free
-            # forced moves, so we don't reward them.
+            # and resource diversity of the chosen vertex.
             if state.phase == Phase.SETUP and action.type == ActionType.PLACE_SETTLEMENT:
                 pip = _vertex_pip_score(action.vertex_id, state)
-                div = _vertex_resource_diversity(action.vertex_id, state)
+                vertex_resources = _vertex_resources(action.vertex_id, state)
+                div = len(vertex_resources)
                 # Normalise: 15 pips is the theoretical ceiling; 3 = full diversity.
-                rewards[acting_pid] += self.setup_settle_reward * (pip / 15.0 + div / 3.0) / 2.0
+                # Subtract 0.5 to centre around 0: below-average spots get a small
+                # penalty, above-average spots get a bonus.  This ensures the
+                # advantage signal for bad placements is negative, not just small.
+                setup_reward = self.setup_settle_reward * ((pip / 15.0 + div / 3.0) / 2.0 - 0.5)
+
+                # On the second setup settlement, reward complementing the first:
+                # two settlements can cover at most 5 resource types total.
+                prior_resources = _player_setup_resource_union(acting_pid, state)
+                if prior_resources:
+                    combined_div = len(prior_resources | vertex_resources)
+                    setup_reward += self.setup_settle_reward * (combined_div / 5.0 - 0.5)
+
+                rewards[acting_pid] += setup_reward
+
+            if state.phase == Phase.SETUP and action.type == ActionType.PLACE_ROAD:
+                road_target = _setup_road_direction_score(action.edge_id, acting_pid, state)
+                if road_target > 0.0:
+                    rewards[acting_pid] += self.setup_road_reward * (road_target - 0.8)
 
             if state.phase != Phase.SETUP:
+                owned_buildings = _owned_building_count(state, acting_pid)
+                best_road_value = _best_road_expansion_value(state, acting_pid, self._engine)
+                opening_bias = _opening_strategy_bias(acting_pid, state)
+                road_bias = min(1.0, max(0.0, opening_bias / 8.0))
+                dev_bias = min(1.0, max(0.0, -opening_bias / 8.0))
+
                 for i in range(self.num_players):
                     vp_delta = new_public_vp[i] - old_public_vp[i]
                     rewards[i] += self.public_vp_reward * vp_delta
 
                 if action.type == ActionType.PLACE_ROAD:
-                    # Reward roads that open new reachable buildable vertices;
-                    # ignore roads that lead only to occupied or already-reachable spots.
-                    old_reach = _reachable_buildable_count(state, acting_pid)
-                    new_reach = _reachable_buildable_count(self._state, acting_pid)
-                    if new_reach > old_reach:
-                        rewards[acting_pid] += self.road_reward
+                    # Reward roads that improve the best reachable settlement
+                    # target, especially when they open higher-pip or missing-
+                    # resource spots. Roads that fail to improve the settlement
+                    # frontier are discouraged once a player could already settle.
+                    old_build = _reachable_buildable_verts(state, acting_pid)
+                    new_build = _reachable_buildable_verts(self._state, acting_pid)
+                    old_best = max((_settlement_target_score(v, acting_pid, state) for v in old_build), default=0.0)
+                    new_best = max((_settlement_target_score(v, acting_pid, state) for v in new_build), default=0.0)
+                    improvement = max(0.0, new_best - old_best)
+                    if improvement > 0.0:
+                        rewards[acting_pid] += self.road_reward * (new_best + improvement)
+
+                    # Penalise wasting road materials when a legal settlement spot
+                    # already exists (regardless of whether the player can afford it)
+                    # AND this road didn't grant Longest Road.
+                    p_actor = state.players[acting_pid]
+                    has_legal_settle_spot = (
+                        p_actor.settlements_left > 0
+                        and bool(old_build)   # had a reachable buildable vertex before this road
+                    )
+                    road_gave_lr = (
+                        self._state.longest_road_owner == acting_pid
+                        and state.longest_road_owner != acting_pid
+                    )
+                    settlement_cost = self._engine.BUILD_COSTS["settlement"]
+                    can_afford_settlement_now = p_actor.can_afford(settlement_cost)
+                    settle_resource_types_owned = sum(
+                        1
+                        for resource, amount in settlement_cost.items()
+                        if p_actor.resources.get(resource, 0) >= amount
+                    )
+                    if has_legal_settle_spot and not road_gave_lr:
+                        penalty = self.road_waste_penalty
+                        # Strongly discourage roading when the player could already
+                        # convert resources into a settlement and this road doesn't
+                        # meaningfully improve the best available settlement target.
+                        if can_afford_settlement_now:
+                            penalty *= 3.0 if improvement < 0.25 else 0.5
+                        elif improvement <= 0.0:
+                            penalty *= 1.5
+                        rewards[acting_pid] -= penalty
+                    elif (
+                        self.near_settlement_road_penalty > 0.0
+                        and not road_gave_lr
+                        and not has_legal_settle_spot
+                        and settle_resource_types_owned >= 2
+                    ):
+                        penalty = self.near_settlement_road_penalty
+                        if settle_resource_types_owned >= 3:
+                            penalty *= 1.5
+                        if improvement < 0.25:
+                            rewards[acting_pid] -= penalty
+                        else:
+                            rewards[acting_pid] -= 0.35 * penalty
 
                 if action.type == ActionType.BUY_DEV_CARD and new_dev_total > old_dev_total:
                     rewards[acting_pid] += self.buy_dev_reward
+                    if owned_buildings <= 2:
+                        rewards[acting_pid] += self.opening_strategy_bonus * dev_bias
+                        if best_road_value > 0.0:
+                            rewards[acting_pid] -= self.opening_strategy_bonus * road_bias * min(1.0, best_road_value)
+
+                if action.type == ActionType.END_TURN:
+                    if owned_buildings <= 2 and best_road_value > 0.0:
+                        stall_scale = 0.35 + 0.65 * road_bias
+                        rewards[acting_pid] -= self.expansion_stall_penalty * stall_scale * best_road_value
+
+                if action.type == ActionType.PLACE_SETTLEMENT:
+                    production_gain = max(0.0, new_production - old_production)
+                    rewards[acting_pid] += self.settlement_prod_reward * (production_gain / 15.0)
+
+                if action.type == ActionType.UPGRADE_CITY:
+                    # Reward upgrading a settlement that sits on high-pip hexes.
+                    pip = _vertex_pip_score(action.vertex_id, state)
+                    rewards[acting_pid] += self.city_pip_reward * (pip / 15.0)
+                    production_gain = max(0.0, new_production - old_production)
+                    rewards[acting_pid] += self.city_prod_reward * (production_gain / 15.0)
+
+                if action.type == ActionType.MARITIME_TRADE:
+                    rewards[acting_pid] -= self.maritime_trade_penalty
+                    p_old = state.players[acting_pid]
+                    p_new = self._state.players[acting_pid]
+                    build_costs = self._engine.BUILD_COSTS
+                    old_can_build = any(
+                        p_old.can_afford(build_costs[name])
+                        for name in ("road", "settlement", "city", "dev_card")
+                    )
+                    new_can_build = any(
+                        p_new.can_afford(build_costs[name])
+                        for name in ("road", "settlement", "city", "dev_card")
+                    )
+                    dev_gain = new_dev_total - old_dev_total
+                    public_vp_gain = new_public_vp[acting_pid] - old_public_vp[acting_pid]
+                    if not new_can_build or (old_can_build and dev_gain <= 0 and public_vp_gain <= 0):
+                        rewards[acting_pid] -= self.empty_trade_penalty
 
                 # ── Dev card play rewards ──────────────────────────────────
                 if action.type == ActionType.MOVE_ROBBER:
                     # Reward placing the robber on a productive hex that hurts an opponent.
                     # Applies whether triggered by a 7 or a Knight card.
                     target_hex = action.hex_id
-                    has_opponent = any(
-                        state.vertex_owner[v] not in (-1, acting_pid)
-                        for v in state.topology.hex_vertices[target_hex]
-                    )
                     pip = _PIP_TABLE.get(state.board.hexes[target_hex].token or 0, 0)
+                    # Which opponents have pieces on this hex?
+                    opponents_on_hex = [
+                        state.vertex_owner[v]
+                        for v in state.topology.hex_vertices[target_hex]
+                        if state.vertex_owner[v] not in (-1, acting_pid)
+                    ]
+                    has_opponent = bool(opponents_on_hex)
+                    # Is the robbed player the current VP leader?
+                    leader_pid = max(
+                        (p for p in range(self.num_players) if p != acting_pid),
+                        key=lambda p: old_public_vp[p],
+                    )
+                    robbing_leader = any(p == leader_pid for p in opponents_on_hex)
                     if pip == 0:
                         # Desert or token-less hex — actively penalise this choice.
                         rewards[acting_pid] -= self.robber_block_reward
@@ -653,6 +966,9 @@ class CatanEnv:
                         # Bonus when an opponent settlement/city is also on that hex.
                         if has_opponent:
                             rewards[acting_pid] += self.robber_block_reward * (pip / 5.0)
+                        # Extra bonus for targeting the VP leader.
+                        if robbing_leader:
+                            rewards[acting_pid] += self.robber_leader_bonus * (pip / 5.0)
 
                 if action.type == ActionType.PLAY_MONOPOLY:
                     # Reward proportional to how many cards were stolen.

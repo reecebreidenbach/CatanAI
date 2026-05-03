@@ -12,6 +12,11 @@ import torch
 import torch.nn.functional as F
 import numpy as np
 from policy import CatanPolicy
+from catan_env import (
+    _ACT_ROLL, _ACT_END, _ACT_SETTLE, _ACT_ROAD, _ACT_CITY,
+    _ACT_ROBBER, _ACT_TRADE, _ACT_BUY, _ACT_KNIGHT,
+    _ACT_MONOPOLY, _ACT_YOP, _ACT_ROAD_BUILDING,
+)
 
 # Edit these here and every phase file picks up the change automatically.
 
@@ -22,7 +27,7 @@ GAMMA       = 0.99
 GAE_LAMBDA  = 0.95    
 CLIP_EPS    = 0.2     
 VF_COEF     = 0.5     
-ENT_COEF    = 0.01    
+ENT_COEF    = 0.03    
 N_STEPS     = 4096    # large enough to contain several complete Catan games
 N_EPOCHS    = 4       
 BATCH_SIZE  = 64      
@@ -36,6 +41,102 @@ CKPT_PHASE1 = "phase1_policy.pt"   # output of train_phase1.py
 CKPT_PHASE2 = "phase2_policy.pt"   # output of train_phase2.py
 CKPT_PHASE3 = "phase3_policy.pt"   # output of train_phase3.py
 CKPT_LEAGUE = "league_pool.pt"     # list of frozen snapshots (phase 3)
+
+
+# ── Action-type classifier (shared across all phase files) ───────────────────
+
+def _act_type(idx: int) -> str:
+    if idx == _ACT_ROLL:                            return "roll"
+    if idx == _ACT_END:                             return "end"
+    if _ACT_SETTLE <= idx < _ACT_ROAD:              return "settle"
+    if _ACT_ROAD   <= idx < _ACT_CITY:              return "road"
+    if _ACT_CITY   <= idx < _ACT_ROBBER:            return "city"
+    if _ACT_ROBBER <= idx < _ACT_END:               return "robber"
+    if _ACT_TRADE  <= idx < _ACT_BUY:               return "trade"
+    if idx == _ACT_BUY:                             return "buydev"
+    if idx == _ACT_KNIGHT:                          return "knight"
+    if _ACT_MONOPOLY <= idx < _ACT_YOP:             return "monopoly"
+    if _ACT_YOP <= idx < _ACT_ROAD_BUILDING:        return "yop"
+    if idx == _ACT_ROAD_BUILDING:                   return "roadbuild"
+    return "other"
+
+
+# ── Per-phase reward configs ──────────────────────────────────────────────────
+# Phase 1 uses stronger shaping to bootstrap basic game play quickly.
+# Phase 2/3 anneal shaping down toward pure win/loss so the policy doesn't
+# overfit to the proxy signals.
+#
+# The env already applies win_reward and loss_penalty in step() at game end.
+# Rollout code must NOT subtract loss_penalty a second time.
+
+REWARD_CONFIG_PHASE1 = {
+    # Terminal
+    "win_reward":          5.0,
+    "loss_penalty":        7.0,   # strong — losing to randoms/greedy should hurt
+    # Dense shaping (higher in Phase 1 to guide early learning)
+    "public_vp_reward":    0.5,
+    "road_reward":         0.08,
+    "buy_dev_reward":      0.10,
+    "setup_settle_reward": 5.0,   # Phase1: max spot ~4.3, worst ~1.7 — delta 2.6 > game noise
+    "robber_block_reward": 0.1,
+    "monopoly_reward":     0.3,
+    "yop_build_reward":    0.15,
+    "city_pip_reward":     0.15,
+    "settlement_prod_reward": 0.12,
+    "city_prod_reward":    0.12,
+    "road_waste_penalty":  0.05,
+    "near_settlement_road_penalty": 0.0,
+    "maritime_trade_penalty": 0.0,
+    "empty_trade_penalty": 0.0,
+    "robber_leader_bonus": 0.1,
+}
+
+REWARD_CONFIG_PHASE2 = {
+    # Terminal (same magnitude — win still outweighs loss)
+    "win_reward":          5.0,
+    "loss_penalty":        2.0,   # softer — all seats learn simultaneously
+    # Dense shaping (reduced — rely more on win/loss signal in self-play)
+    "public_vp_reward":    0.3,
+    "road_reward":         0.05,
+    "buy_dev_reward":      0.07,
+    "setup_settle_reward": 4.0,   # Phase2: max spot ~3.5, worst ~1.3 — habit locks in
+    "robber_block_reward": 0.07,
+    "monopoly_reward":     0.2,
+    "yop_build_reward":    0.10,
+    "city_pip_reward":     0.10,
+    "settlement_prod_reward": 0.10,
+    "city_prod_reward":    0.14,
+    "road_waste_penalty":  0.04,
+    "near_settlement_road_penalty": 0.0,
+    "maritime_trade_penalty": 0.01,
+    "empty_trade_penalty": 0.02,
+    "robber_leader_bonus": 0.07,
+}
+
+REWARD_CONFIG_PHASE3 = {
+    # Terminal
+    "win_reward":          5.0,
+    "loss_penalty":        3.0,   # moderate — league opponents are past selves
+    # Dense shaping (minimal — close to pure win/loss by league stage)
+    "public_vp_reward":    0.2,
+    "road_reward":         0.02,
+    "buy_dev_reward":      0.05,
+    "setup_settle_reward": 3.0,   # Phase3: max spot ~2.6, worst ~1.0 — win signal still dominates
+    "robber_block_reward": 0.05,
+    "monopoly_reward":     0.15,
+    "yop_build_reward":    0.07,
+    "city_pip_reward":     0.14,
+    "settlement_prod_reward": 0.14,
+    "city_prod_reward":    0.20,
+    "road_waste_penalty":  0.08,
+    "near_settlement_road_penalty": 0.10,
+    "setup_road_reward":   0.75,
+    "expansion_stall_penalty": 0.10,
+    "opening_strategy_bonus": 0.08,
+    "maritime_trade_penalty": 0.02,
+    "empty_trade_penalty": 0.05,
+    "robber_leader_bonus": 0.05,
+}
 
 
 # ── Factory helpers ──────────────────────────────────────────────────────────

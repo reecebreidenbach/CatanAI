@@ -34,23 +34,16 @@ from catan_env import CatanEnv
 from ppo_utils import (
     NUM_PLAYERS, N_STEPS, LOG_EVERY,
     CKPT_PHASE1, CKPT_PHASE2,
+    REWARD_CONFIG_PHASE2 as REWARD_CONFIG,
     make_policy, compute_gae, ppo_update,
+    _act_type,
 )
+import ppo_utils as _ppo_utils
+_ppo_utils.ENT_COEF = 0.05   # middle ground: enough exploration for P1/P2/P3 without swamping their gradients
 
 # ── Phase 2 specific settings ────────────────────────────────────────────────
-NUM_UPDATES = 500   # how many PPO updates to run in this phase
+NUM_UPDATES = 200  # how many PPO updates to run in this phase
 N_WORKERS   = 4     # parallel collection workers — tune to physical CPU cores
-REWARD_CONFIG = {
-    "public_vp_reward": 0.3,
-    "road_reward": 0.05,
-    "buy_dev_reward": 0.10,
-    "win_reward": 5.0,
-    "loss_penalty": 2.0,  # softer — self-play: both sides are learning, don't destabilise
-    "setup_settle_reward": 0.5,
-    "robber_block_reward": 0.1,
-    "monopoly_reward": 0.3,
-    "yop_build_reward": 0.15,
-}
 
 
 # ── Checkpoint helpers ────────────────────────────────────────────────────────
@@ -114,7 +107,6 @@ def _worker_collect(args: tuple) -> dict:
     rewards:    list = []
     dones:      list = []
     wins: dict = defaultdict(int)
-    last_step_idx: dict = {}   # pid -> last buffer index in the current game
 
     obs_np, mask_np = env.reset()
 
@@ -132,23 +124,23 @@ def _worker_collect(args: tuple) -> dict:
 
         rew, done = env.step(action.item())
 
+        next_pid = env.current_player if not done else -1
+
         obs_list.append(obs_np)
         masks_list.append(mask_np)
         actions.append(action.item())
         log_probs.append(dist.log_prob(action).item())
         values.append(value.squeeze().item())
         rewards.append(float(rew[pid]))
-        dones.append(float(done))
-        last_step_idx[pid] = len(rewards) - 1
+        # Mark a GAE boundary whenever the acting player changes — prevents
+        # bootstrapping P0's value off P1's next-state value, which corrupts
+        # advantages for all non-first-mover seats.
+        player_switch = (next_pid != pid) and not done
+        dones.append(1.0 if done or player_switch else 0.0)
 
         if done:
             if env.winner is not None:
                 wins[env.winner] += 1
-                loss_pen = reward_config.get("loss_penalty", 5.0)
-                for lp, idx in last_step_idx.items():
-                    if lp != env.winner:
-                        rewards[idx] -= loss_pen
-            last_step_idx.clear()
 
         obs_np, mask_np = env.reset() if done else env.observe()
 
@@ -203,59 +195,75 @@ if __name__ == "__main__":
           f"({N_WORKERS} workers × {n_per_worker} steps = {N_STEPS} steps/update).\n")
 
     win_counts: dict = defaultdict(int)
+    act_totals: dict = defaultdict(int)
 
     with mp.Pool(N_WORKERS) as pool:
-        for update in range(1, NUM_UPDATES + 1):
-            # Serialize current policy weights once per update
-            buf_io = io.BytesIO()
-            torch.save(policy.state_dict(), buf_io)
-            weights_bytes = buf_io.getvalue()
+        try:
+            for update in range(1, NUM_UPDATES + 1):
+                # Serialize current policy weights once per update
+                buf_io = io.BytesIO()
+                torch.save(policy.state_dict(), buf_io)
+                weights_bytes = buf_io.getvalue()
 
-            worker_args = [
-                (weights_bytes, n_per_worker, NUM_PLAYERS, REWARD_CONFIG)
-            ] * N_WORKERS
+                worker_args = [
+                    (weights_bytes, n_per_worker, NUM_PLAYERS, REWARD_CONFIG)
+                ] * N_WORKERS
 
-            results = pool.map(_worker_collect, worker_args)
+                results = pool.map(_worker_collect, worker_args)
 
-            # Concatenate worker buffers into one flat buffer
-            all_obs       = np.concatenate([r["obs"]       for r in results], axis=0)
-            all_masks     = np.concatenate([r["masks"]     for r in results], axis=0)
-            all_actions   = np.concatenate([r["actions"]   for r in results])
-            all_log_probs = np.concatenate([r["log_probs"] for r in results])
-            all_values    = np.concatenate([r["values"]    for r in results])
-            all_rewards   = sum([r["rewards"] for r in results], [])
-            all_dones     = sum([r["dones"]   for r in results], [])
+                # Concatenate worker buffers into one flat buffer
+                all_obs       = np.concatenate([r["obs"]       for r in results], axis=0)
+                all_masks     = np.concatenate([r["masks"]     for r in results], axis=0)
+                all_actions   = np.concatenate([r["actions"]   for r in results])
+                all_log_probs = np.concatenate([r["log_probs"] for r in results])
+                all_values    = np.concatenate([r["values"]    for r in results])
+                all_rewards   = sum([r["rewards"] for r in results], [])
+                all_dones     = sum([r["dones"]   for r in results], [])
 
-            for r in results:
-                for pid, count in r["wins"].items():
-                    win_counts[pid] += count
+                for r in results:
+                    for pid, count in r["wins"].items():
+                        win_counts[pid] += count
 
-            # Convert to tensor format expected by compute_gae / ppo_update
-            val_tensors = list(torch.from_numpy(all_values).unbind())
-            buf = {
-                "obs":       [torch.from_numpy(all_obs)],
-                "masks":     [torch.from_numpy(all_masks)],
-                "actions":   list(torch.from_numpy(all_actions).unbind()),
-                "log_probs": list(torch.from_numpy(all_log_probs).unbind()),
-                "values":    val_tensors,
-                "rewards":   all_rewards,
-                "dones":     all_dones,
-            }
+                # Count action types from this update's collected actions
+                for a in all_actions:
+                    act_totals[_act_type(int(a))] += 1
 
-            adv, ret   = compute_gae(buf["rewards"], buf["values"], buf["dones"])
-            total_loss = ppo_update(buf, adv, ret, policy, optim)
+                # Convert to tensor format expected by compute_gae / ppo_update
+                val_tensors = list(torch.from_numpy(all_values).unbind())
+                buf = {
+                    "obs":       [torch.from_numpy(all_obs)],
+                    "masks":     [torch.from_numpy(all_masks)],
+                    "actions":   list(torch.from_numpy(all_actions).unbind()),
+                    "log_probs": list(torch.from_numpy(all_log_probs).unbind()),
+                    "values":    val_tensors,
+                    "rewards":   all_rewards,
+                    "dones":     all_dones,
+                }
 
-            if update % LOG_EVERY == 0:
-                games    = sum(win_counts.values())
-                total    = games or 1
-                rates    = {p: win_counts[p] / total for p in range(NUM_PLAYERS)}
-                rate_str = " | ".join(
-                    f"p{p} {rates.get(p, 0):.2f}"
-                    for p in range(NUM_PLAYERS)
-                )
-                print(f"Update {update:4d}/{NUM_UPDATES} | loss {total_loss:9.4f} | "
-                      f"games {games:3d} | {rate_str}")
-                win_counts.clear()
+                adv, ret   = compute_gae(buf["rewards"], buf["values"], buf["dones"])
+                total_loss = ppo_update(buf, adv, ret, policy, optim)
+
+                if update % LOG_EVERY == 0:
+                    games    = sum(win_counts.values())
+                    total    = games or 1
+                    rates    = {p: win_counts[p] / total for p in range(NUM_PLAYERS)}
+                    rate_str = " | ".join(
+                        f"p{p} {rates.get(p, 0):.2f}"
+                        for p in range(NUM_PLAYERS)
+                    )
+                    n_acts = sum(act_totals.values()) or 1
+                    acts   = "  ".join(f"{k}:{act_totals[k]/n_acts:.2f}" for k in
+                                       ["roll","end","settle","road","city","trade","robber","buydev"])
+                    print(f"Update {update:4d}/{NUM_UPDATES} | loss {total_loss:9.4f} | entropy {torch.mean(-torch.stack(buf['log_probs'])).item():.4f} |"
+                          f"games {games:3d} | {rate_str}")
+                    print(f"  actions: {acts}")
+                    win_counts.clear()
+                    act_totals.clear()
+
+        except KeyboardInterrupt:
+            print("\nInterrupted — terminating workers and saving checkpoint...")
+            pool.terminate()
+            pool.join()
 
     torch.save(policy.state_dict(), save_path)
     print(f"\nPhase 2 complete. Saved {save_path.name}")

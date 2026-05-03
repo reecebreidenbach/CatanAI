@@ -22,29 +22,24 @@ import torch
 import torch.nn.functional as F
 from collections import defaultdict
 
-from catan_env     import CatanEnv, RandomAgent, _ACT_ROLL, _ACT_END, _ACT_SETTLE, _ACT_ROAD, _ACT_CITY, _ACT_ROBBER, _ACT_TRADE, _ACT_BUY, _ACT_KNIGHT, _ACT_MONOPOLY, _ACT_YOP, _ACT_ROAD_BUILDING
+from catan_env     import CatanEnv, RandomAgent, GreedyVPAgent, _ACT_ROLL, _ACT_END, _ACT_SETTLE, _ACT_ROAD, _ACT_CITY, _ACT_ROBBER, _ACT_TRADE, _ACT_BUY, _ACT_KNIGHT, _ACT_MONOPOLY, _ACT_YOP, _ACT_ROAD_BUILDING
 from ppo_utils     import (
     NUM_PLAYERS, HIDDEN_SIZE, N_STEPS, LOG_EVERY,
     GAMMA, GAE_LAMBDA,
     CKPT_PHASE1,
+    REWARD_CONFIG_PHASE1 as REWARD_CONFIG,
     make_policy, compute_gae, ppo_update,
 )
+import ppo_utils as _ppo_utils
+_ppo_utils.ENT_COEF = 0.05   # Phase 1 needs stronger entropy push; single-seat training collapses fast
 
 # ── Phase 1 specific settings ────────────────────────────────────────────────
 NUM_UPDATES          = 300   # how many PPO updates to run in this phase
 N_EPISODES_PER_UPDATE = 4    # complete games collected before each update
 EPISODE_TIMEOUT      = 3000  # steps per game safety limit (no winner declared)
-REWARD_CONFIG = {
-    "public_vp_reward": 0.5,
-    "road_reward": 0.08,
-    "buy_dev_reward": 0.10,
-    "win_reward": 5.0,
-    "loss_penalty": 7.0,  # strong but not 2x win_reward — avoids gradient spikes
-    "setup_settle_reward": 0.5,
-    "robber_block_reward": 0.1,
-    "monopoly_reward": 0.3,
-    "yop_build_reward": 0.15,
-}
+# OPPONENT_POOL: mix of random and greedy agents for curriculum variety.
+# 50% greedy makes opponents meaningfully stronger than pure random.
+OPPONENT_POOL_MIX = 0.5   # fraction of opponent seats that use GreedyVPAgent
 
 
 def _checkpoint_dir() -> Path:
@@ -71,7 +66,9 @@ def _next_checkpoint_path() -> Path:
 # ── Setup ────────────────────────────────────────────────────────────────────
 env            = CatanEnv(num_players=NUM_PLAYERS, reward_shaping=True, **REWARD_CONFIG)
 policy, optim  = make_policy(env)
-random_agents  = [RandomAgent() for _ in range(NUM_PLAYERS - 1)]
+# Mixed opponent pool: some greedy, some random, decided per episode.
+_greedy_agent  = GreedyVPAgent(env)
+_random_agent  = RandomAgent()
 
 resume_path = _latest_checkpoint_path()
 save_path = _next_checkpoint_path()
@@ -146,14 +143,13 @@ def collect_rollout(n_episodes: int) -> tuple:
             pid = env.current_player
 
             if pid != learner_pid:
-                action_idx = random_agents[0].choose(obs, mask)
+                opp = _greedy_agent if random.random() < OPPONENT_POOL_MIX else _random_agent
+                action_idx = opp.choose(obs, mask)
                 _, done    = env.step(action_idx)
                 if done:
                     if env.winner is not None:
                         episode_wins[env.winner] += 1
                         learner_wins += int(env.winner == learner_pid)
-                        if env.winner != learner_pid and ep_rewards:
-                            ep_rewards[-1] -= REWARD_CONFIG["loss_penalty"]
                     break
                 else:
                     obs, mask = env.observe()
@@ -186,8 +182,6 @@ def collect_rollout(n_episodes: int) -> tuple:
                 if env.winner is not None:
                     episode_wins[env.winner] += 1
                     learner_wins += int(env.winner == learner_pid)
-                    if env.winner != learner_pid and ep_rewards:
-                        ep_rewards[-1] -= REWARD_CONFIG["loss_penalty"]
                 break
             else:
                 obs, mask = env.observe()
@@ -237,7 +231,7 @@ for update in range(1, NUM_UPDATES + 1):
         n_acts = sum(act_totals.values()) or 1
         acts   = "  ".join(f"{k}:{act_totals[k]/n_acts:.2f}" for k in
                            ["roll","end","settle","road","city","trade","robber","buydev"])
-        print(f"Update {update:4d}/{NUM_UPDATES} | loss {total_loss:9.4f} | games {games:3d} | learner {learner_rate:.2f}")
+        print(f"Update {update:4d}/{NUM_UPDATES} | loss {total_loss:9.4f} | games {games:3d} | learner {learner_rate:.2f} | entropy {torch.mean(-torch.stack(buf['log_probs'])).item():.4f}")
         print(f"  actions: {acts}")
         win_counts.clear()
         learner_win_total = 0
