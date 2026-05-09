@@ -1,3 +1,4 @@
+# AI-ASSISTED
 """
 catan_env.py  —  Gym-style multi-agent environment wrapper for the Catan engine.
 
@@ -588,6 +589,19 @@ def _opening_strategy_bias(pid: int, state: "GameState") -> float:
     return (road_core + 0.35 * wool) - (dev_core + 0.35 * wool)
 
 
+def _build_progress_score(player, build_costs: dict[str, dict[Resource, int]]) -> float:
+    """Best fractional progress toward any common build option."""
+    best = 0.0
+    for name in ("road", "settlement", "city", "dev_card"):
+        cost = build_costs[name]
+        required = sum(cost.values())
+        if required <= 0:
+            continue
+        matched = sum(min(player.resources.get(resource, 0), amount) for resource, amount in cost.items())
+        best = max(best, matched / required)
+    return best
+
+
 def _owned_building_count(state: "GameState", pid: int) -> int:
     """Count settlements and cities currently on the board for pid."""
     return sum(
@@ -595,6 +609,24 @@ def _owned_building_count(state: "GameState", pid: int) -> int:
         for vertex_id, owner in enumerate(state.vertex_owner)
         if owner == pid and state.vertex_building[vertex_id] in (1, 2)
     )
+
+
+def _city_build_is_feasible(state: "GameState", pid: int) -> bool:
+    """Return True when pid has a settlement that could eventually be upgraded."""
+    player = state.players[pid]
+    if player.cities_left <= 0:
+        return False
+    return any(
+        owner == pid and building == 1
+        for owner, building in zip(state.vertex_owner, state.vertex_building)
+    )
+
+
+def _settlement_build_is_feasible(state: "GameState", pid: int) -> bool:
+    """Return True when pid has settlements left and a reachable buildable vertex."""
+    if state.players[pid].settlements_left <= 0:
+        return False
+    return bool(_reachable_buildable_verts(state, pid))
 
 
 # ── Greedy discard helper ───────────────────────────────────────────────────────
@@ -669,6 +701,10 @@ class CatanEnv:
         setup_road_reward: float = 0.0,
         expansion_stall_penalty: float = 0.0,
         opening_strategy_bonus: float = 0.0,
+        productive_trade_reward: float = 0.0,
+        city_unlock_trade_reward: float = 0.0,
+        settlement_unlock_trade_reward: float = 0.0,
+        missing_resource_trade_reward: float = 0.0,
         maritime_trade_penalty: float = 0.0,
         empty_trade_penalty: float = 0.0,
         robber_leader_bonus: float = 0.1,
@@ -695,6 +731,10 @@ class CatanEnv:
         self.setup_road_reward    = setup_road_reward
         self.expansion_stall_penalty = expansion_stall_penalty
         self.opening_strategy_bonus = opening_strategy_bonus
+        self.productive_trade_reward = productive_trade_reward
+        self.city_unlock_trade_reward = city_unlock_trade_reward
+        self.settlement_unlock_trade_reward = settlement_unlock_trade_reward
+        self.missing_resource_trade_reward = missing_resource_trade_reward
         self.maritime_trade_penalty = maritime_trade_penalty
         self.empty_trade_penalty = empty_trade_penalty
         self.robber_leader_bonus  = robber_leader_bonus
@@ -925,6 +965,9 @@ class CatanEnv:
                     p_old = state.players[acting_pid]
                     p_new = self._state.players[acting_pid]
                     build_costs = self._engine.BUILD_COSTS
+                    old_produced_resources = _player_production_resources(acting_pid, state)
+                    old_progress = _build_progress_score(p_old, build_costs)
+                    new_progress = _build_progress_score(p_new, build_costs)
                     old_can_build = any(
                         p_old.can_afford(build_costs[name])
                         for name in ("road", "settlement", "city", "dev_card")
@@ -935,6 +978,25 @@ class CatanEnv:
                     )
                     dev_gain = new_dev_total - old_dev_total
                     public_vp_gain = new_public_vp[acting_pid] - old_public_vp[acting_pid]
+                    progress_gain = max(0.0, new_progress - old_progress)
+                    if progress_gain > 0.0:
+                        rewards[acting_pid] += self.productive_trade_reward * progress_gain
+                    if not old_can_build and new_can_build:
+                        rewards[acting_pid] += self.productive_trade_reward
+                    if (
+                        _city_build_is_feasible(state, acting_pid)
+                        and not p_old.can_afford(build_costs["city"])
+                        and p_new.can_afford(build_costs["city"])
+                    ):
+                        rewards[acting_pid] += self.city_unlock_trade_reward
+                    if (
+                        _settlement_build_is_feasible(state, acting_pid)
+                        and not p_old.can_afford(build_costs["settlement"])
+                        and p_new.can_afford(build_costs["settlement"])
+                    ):
+                        rewards[acting_pid] += self.settlement_unlock_trade_reward
+                    if action.receive is not None and action.receive not in old_produced_resources:
+                        rewards[acting_pid] += self.missing_resource_trade_reward
                     if not new_can_build or (old_can_build and dev_gain <= 0 and public_vp_gain <= 0):
                         rewards[acting_pid] -= self.empty_trade_penalty
 

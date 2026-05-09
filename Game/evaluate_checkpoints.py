@@ -9,7 +9,7 @@ from pathlib import Path
 
 import torch
 
-from catan_env import CatanEnv, GreedyVPAgent, RandomAgent, _opening_strategy_bias, decode_action
+from catan_env import CatanEnv, GreedyVPAgent, RandomAgent, _build_progress_score, _opening_strategy_bias, decode_action
 from game_engine import ActionType
 from game_state import DevCard
 from policy import CatanPolicy, masked_sample
@@ -35,7 +35,7 @@ class PolicyAgent:
 
 
 def _latest_checkpoint_paths() -> list[Path]:
-    game_dir = Path(__file__).resolve().parent
+    game_dir = Path(__file__).resolve().parent / "models"
     found: list[Path] = []
     for base in (CKPT_PHASE2, CKPT_PHASE3):
         stem = Path(base).stem
@@ -47,12 +47,12 @@ def _latest_checkpoint_paths() -> list[Path]:
 
 
 def _available_checkpoints() -> list[Path]:
-    game_dir = Path(__file__).resolve().parent
+    game_dir = Path(__file__).resolve().parent / "models"
     return sorted(game_dir.glob("phase*_policy*.pt"), key=lambda p: p.stat().st_mtime)
 
 
 def _resolve_checkpoint_paths(checkpoints: list[Path]) -> list[Path]:
-    game_dir = Path(__file__).resolve().parent
+    game_dir = Path(__file__).resolve().parent / "models"
     resolved: list[Path] = []
     missing: list[Path] = []
 
@@ -160,6 +160,13 @@ def _print_result(result: dict[str, object]) -> None:
         f"avg_maritime_trades={result['avg_maritime_trades']:.2f}"
     )
     print(
+        "  Trade    "
+        f"avg_unlocking_trades={result['avg_unlocking_trades']:.2f}  "
+        f"unlock_rate={_format_percent(result['trade_unlock_rate'])}  "
+        f"avg_productive_trades={result['avg_productive_trades']:.2f}  "
+        f"productive_rate={_format_percent(result['productive_trade_rate'])}"
+    )
+    print(
         "  Opening  "
         f"3rd_settle_rate={_format_percent(result['third_settlement_rate'])}  "
         f"3rd_settle_by_t100={_format_percent(result['third_settlement_by_100_rate'])}  "
@@ -191,6 +198,8 @@ def evaluate_policy(policy_path: Path, games: int, seed: int) -> dict[str, objec
     roads_built: list[int] = []
     cities_built: list[int] = []
     maritime_trades: list[int] = []
+    unlocking_trades: list[int] = []
+    productive_trades: list[int] = []
     final_vp: list[int] = []
     third_settlement_turns: list[int] = []
     early_road_counts: list[int] = []
@@ -206,6 +215,8 @@ def evaluate_policy(policy_path: Path, games: int, seed: int) -> dict[str, objec
         obs, mask = env.reset()
         steps = 0
         game_trade_count = 0
+        game_unlocking_trades = 0
+        game_productive_trades = 0
         game_early_roads = 0
         game_early_dev_buys = 0
         third_settlement_turn: int | None = None
@@ -222,6 +233,13 @@ def evaluate_policy(policy_path: Path, games: int, seed: int) -> dict[str, objec
                 action_counts[action.type.name] += 1
                 if action.type == ActionType.MARITIME_TRADE:
                     game_trade_count += 1
+                    build_costs = env._engine.BUILD_COSTS
+                    player = state.players[learner_pid]
+                    old_progress = _build_progress_score(player, build_costs)
+                    old_can_build = any(
+                        player.can_afford(build_costs[name])
+                        for name in ("road", "settlement", "city", "dev_card")
+                    )
                 if third_settlement_turn is None:
                     if action.type == ActionType.PLACE_ROAD:
                         game_early_roads += 1
@@ -230,6 +248,19 @@ def evaluate_policy(policy_path: Path, games: int, seed: int) -> dict[str, objec
                     if action.type == ActionType.PLACE_SETTLEMENT and _owned_vertex_count(state, learner_pid) == 2:
                         third_settlement_turn = state.turn_number
             _, done = env.step(action_idx)
+            if pid == learner_pid and action.type == ActionType.MARITIME_TRADE:
+                new_state = env.state()
+                new_player = new_state.players[learner_pid]
+                build_costs = env._engine.BUILD_COSTS
+                new_progress = _build_progress_score(new_player, build_costs)
+                new_can_build = any(
+                    new_player.can_afford(build_costs[name])
+                    for name in ("road", "settlement", "city", "dev_card")
+                )
+                if not old_can_build and new_can_build:
+                    game_unlocking_trades += 1
+                if new_progress > old_progress or (not old_can_build and new_can_build):
+                    game_productive_trades += 1
             steps += 1
             if not done:
                 obs, mask = env.observe()
@@ -241,6 +272,8 @@ def evaluate_policy(policy_path: Path, games: int, seed: int) -> dict[str, objec
         roads_built.append(sum(1 for owner in final_state.edge_owner if owner == learner_pid))
         cities_built.append(sum(1 for owner, building in zip(final_state.vertex_owner, final_state.vertex_building) if owner == learner_pid and building == 2))
         maritime_trades.append(game_trade_count)
+        unlocking_trades.append(game_unlocking_trades)
+        productive_trades.append(game_productive_trades)
         final_vp.append(_total_vp(final_state, learner_pid))
         early_road_counts.append(game_early_roads)
         early_dev_buy_counts.append(game_early_dev_buys)
@@ -261,6 +294,9 @@ def evaluate_policy(policy_path: Path, games: int, seed: int) -> dict[str, objec
 
     total_early_roads = sum(early_road_counts)
     total_early_dev_buys = sum(early_dev_buy_counts)
+    total_trades = sum(maritime_trades)
+    total_unlocking_trades = sum(unlocking_trades)
+    total_productive_trades = sum(productive_trades)
 
     return {
         "policy": policy_path.name,
@@ -270,6 +306,10 @@ def evaluate_policy(policy_path: Path, games: int, seed: int) -> dict[str, objec
         "avg_roads": sum(roads_built) / games,
         "avg_cities": sum(cities_built) / games,
         "avg_maritime_trades": sum(maritime_trades) / games,
+        "avg_unlocking_trades": _mean(unlocking_trades),
+        "trade_unlock_rate": _share(total_unlocking_trades, total_trades),
+        "avg_productive_trades": _mean(productive_trades),
+        "productive_trade_rate": _share(total_productive_trades, total_trades),
         "avg_vp": sum(final_vp) / games,
         "action_mix": dict(action_counts),
         "third_settlement_rate": len(third_settlement_turns) / games,

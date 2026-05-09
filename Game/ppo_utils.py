@@ -1,3 +1,4 @@
+# AI-ASSISTED
 """
 ppo_utils.py — Shared hyperparameters and functions used by all three phase files.
 
@@ -33,17 +34,14 @@ N_EPOCHS    = 4
 BATCH_SIZE  = 64      
 LOG_EVERY   = 10      
 
-# ── Checkpoint filenames ─────────────────────────────────────────────────────
-# Phase 1 writes CKPT_PHASE1.  Phase 2 reads it and writes CKPT_PHASE2.
-# Phase 3 reads CKPT_PHASE2 and writes CKPT_PHASE3 + CKPT_LEAGUE.
-
-CKPT_PHASE1 = "phase1_policy.pt"   # output of train_phase1.py
-CKPT_PHASE2 = "phase2_policy.pt"   # output of train_phase2.py
-CKPT_PHASE3 = "phase3_policy.pt"   # output of train_phase3.py
-CKPT_LEAGUE = "league_pool.pt"     # list of frozen snapshots (phase 3)
+# Checkpoint filenames
+CKPT_PHASE1 = "models/phase1_policy.pt"
+CKPT_PHASE2 = "models/phase2_policy.pt"
+CKPT_PHASE3 = "models/phase3_policy.pt"
+CKPT_LEAGUE = "models/league_pool.pt"
 
 
-# ── Action-type classifier (shared across all phase files) ───────────────────
+# Action-type classifier
 
 def _act_type(idx: int) -> str:
     if idx == _ACT_ROLL:                            return "roll"
@@ -61,23 +59,15 @@ def _act_type(idx: int) -> str:
     return "other"
 
 
-# ── Per-phase reward configs ──────────────────────────────────────────────────
-# Phase 1 uses stronger shaping to bootstrap basic game play quickly.
-# Phase 2/3 anneal shaping down toward pure win/loss so the policy doesn't
-# overfit to the proxy signals.
-#
-# The env already applies win_reward and loss_penalty in step() at game end.
-# Rollout code must NOT subtract loss_penalty a second time.
+# Per-phase reward configs
 
 REWARD_CONFIG_PHASE1 = {
-    # Terminal
     "win_reward":          5.0,
-    "loss_penalty":        7.0,   # strong — losing to randoms/greedy should hurt
-    # Dense shaping (higher in Phase 1 to guide early learning)
+    "loss_penalty":        7.0,
     "public_vp_reward":    0.5,
     "road_reward":         0.08,
     "buy_dev_reward":      0.10,
-    "setup_settle_reward": 5.0,   # Phase1: max spot ~4.3, worst ~1.7 — delta 2.6 > game noise
+    "setup_settle_reward": 5.0,
     "robber_block_reward": 0.1,
     "monopoly_reward":     0.3,
     "yop_build_reward":    0.15,
@@ -92,54 +82,57 @@ REWARD_CONFIG_PHASE1 = {
 }
 
 REWARD_CONFIG_PHASE2 = {
-    # Terminal (same magnitude — win still outweighs loss)
     "win_reward":          5.0,
-    "loss_penalty":        2.0,   # softer — all seats learn simultaneously
-    # Dense shaping (reduced — rely more on win/loss signal in self-play)
+    "loss_penalty":        2.0,
     "public_vp_reward":    0.3,
-    "road_reward":         0.05,
+    "road_reward":         0.02,
     "buy_dev_reward":      0.07,
-    "setup_settle_reward": 4.0,   # Phase2: max spot ~3.5, worst ~1.3 — habit locks in
+    "setup_settle_reward": 4.0,
     "robber_block_reward": 0.07,
     "monopoly_reward":     0.2,
     "yop_build_reward":    0.10,
     "city_pip_reward":     0.10,
     "settlement_prod_reward": 0.10,
     "city_prod_reward":    0.14,
-    "road_waste_penalty":  0.04,
-    "near_settlement_road_penalty": 0.0,
+    "road_waste_penalty":  0.15,
+    "near_settlement_road_penalty": 0.08,
+    "expansion_stall_penalty": 0.08,
     "maritime_trade_penalty": 0.01,
     "empty_trade_penalty": 0.02,
     "robber_leader_bonus": 0.07,
 }
 
 REWARD_CONFIG_PHASE3 = {
-    # Terminal
     "win_reward":          5.0,
-    "loss_penalty":        3.0,   # moderate — league opponents are past selves
-    # Dense shaping (minimal — close to pure win/loss by league stage)
-    "public_vp_reward":    0.2,
+    "loss_penalty":        3.0,
+    "public_vp_reward":    0.3,
     "road_reward":         0.02,
     "buy_dev_reward":      0.05,
-    "setup_settle_reward": 3.0,   # Phase3: max spot ~2.6, worst ~1.0 — win signal still dominates
+    "setup_settle_reward": 3.0,
     "robber_block_reward": 0.05,
     "monopoly_reward":     0.15,
     "yop_build_reward":    0.07,
-    "city_pip_reward":     0.14,
+    "city_pip_reward":     0.30,
     "settlement_prod_reward": 0.14,
-    "city_prod_reward":    0.20,
-    "road_waste_penalty":  0.08,
-    "near_settlement_road_penalty": 0.10,
+    "city_prod_reward":    0.45,
+    "road_waste_penalty":  0.09,
+    "near_settlement_road_penalty": 0.12,
     "setup_road_reward":   0.75,
     "expansion_stall_penalty": 0.10,
     "opening_strategy_bonus": 0.08,
-    "maritime_trade_penalty": 0.02,
+    "productive_trade_reward": 0.08,
+    "city_unlock_trade_reward": 0.20,
+    "settlement_unlock_trade_reward": 0.15,
+    "missing_resource_trade_reward": 0.08,
+    "maritime_trade_penalty": 0.008,
     "empty_trade_penalty": 0.05,
     "robber_leader_bonus": 0.05,
 }
 
 
-# ── Factory helpers ──────────────────────────────────────────────────────────
+
+
+# Factory helpers
 
 def make_policy(env) -> tuple:
     """

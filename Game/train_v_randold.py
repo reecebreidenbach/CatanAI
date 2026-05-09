@@ -1,3 +1,4 @@
+# AI-ASSISTED
 """
 train_phase3.py — Phase 3: League play training with parallel game collection.
 
@@ -49,7 +50,7 @@ from ppo_utils import (
 NUM_UPDATES    = 2000   # how many PPO updates to run in this phase
 SNAPSHOT_EVERY = 100    # freeze a snapshot into the pool every N updates
 LEAGUE_PROB    = 0.5    # chance any opponent seat draws from the pool
-GREEDY_PROB    = 0.2    # chance any opponent seat uses GreedyVPAgent
+GREEDY_PROB    = 0.4    # chance any opponent seat uses GreedyVPAgent (raised: city pressure)
 RANDOM_PROB    = 0.1    # chance any opponent seat uses RandomAgent
 N_WORKERS      = 4      # parallel collection workers — tune to physical CPU cores
 FIRST_SNAPSHOT_UPDATE = 200  # don't introduce league mirrors immediately
